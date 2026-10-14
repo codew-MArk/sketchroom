@@ -34,7 +34,7 @@ Design decisions
 npm install
 npm start          # http://localhost:3000
 ```
-Open `http://localhost:3000/?room=demo` in two tabs.
+Open https://sketchroom-lf9j.onrender.com in two tabs.
 
 ## Deploy
 Any Node host that supports WebSockets works (Render, Railway, Fly.io). Build command `npm install`, start command `npm start`. The `PORT` env var is respected.
@@ -44,3 +44,5 @@ Any Node host that supports WebSockets works (Render, Railway, Fly.io). Build co
 - One server instance. To scale horizontally, add Redis pub/sub so rooms span instances.
 - No auth. Next: signed room tokens and read-only viewers.
 - Next: shapes, text, infinite canvas, and an operation log for full undo/redo.
+
+
