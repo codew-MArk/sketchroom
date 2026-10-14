@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sketchroom</title>
+<style>
+:root { --bg:#e8ecf2; --board:#fff; --grid:#d9dfe9; --ink:#14213d; --muted:#5b6678; --panel:#fffffff0; --line:#cfd6e2; --font:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0f1218; --board:#1a1f2a; --grid:#262d3b; --ink:#e9edf5; --muted:#98a3b8; --panel:#1a1f2af0; --line:#323b4e; } }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font); display: flex; flex-direction: column; overflow: hidden; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
+.status { font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; background: var(--panel); }
+.people { margin-left: auto; display: flex; }
+.person { width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--bg); margin-left: -6px; display: grid; place-items: center; font-size: 12px; font-weight: 600; color: #fff; }
+main { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 0 14px 14px; position: relative; }
+#stage { position: relative; background: var(--board); border: 1px solid var(--line); border-radius: 10px; }
+#stage::before { content:""; position:absolute; inset:0; pointer-events:none; background-image: radial-gradient(var(--grid) 1.2px, transparent 1.3px); background-size: 28px 28px; }
+canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair; }
+#cursors { position:absolute; inset:0; pointer-events:none; overflow:hidden; }
+.cursor { position:absolute; left:0; top:0; transition: transform 60ms linear; }
+.cursor span { position:absolute; left:12px; top:12px; color:#fff; font-size:12px; font-weight:600; padding:2px 7px; border-radius:6px; white-space:nowrap; }
+.tools { position:absolute; left:26px; bottom:26px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:8px; }
+.tools button { border:1px solid transparent; background:transparent; color:var(--ink); font:inherit; font-size:13px; border-radius:9px; padding:7px 10px; cursor:pointer; }
+.tools button:hover { background: var(--bg); }
+.tools button[aria-pressed="true"] { background: var(--ink); color: var(--board); }
+.tools button:disabled { opacity:.4; cursor:default; }
+.swatch { width:26px; height:26px; padding:0 !important; border-radius:50% !important; box-shadow:0 0 0 1px var(--line); }
+.swatch[aria-pressed="true"] { box-shadow:0 0 0 2px var(--ink); }
+</style>
+</head>
+<body>
+<header><h1>Sketchroom</h1><div class="status" id="status">Connecting…</div><div class="people" id="people"></div></header>
+<main>
+  <div id="stage"><canvas id="cv"></canvas><div id="cursors"></div></div>
+  <div class="tools">
+    <button id="pen" aria-pressed="true">Pen</button>
+    <button id="eraser" aria-pressed="false">Eraser</button>
+    <span id="swatches" style="display:flex;gap:6px"></span>
+    <input id="size" type="range" min="2" max="18" value="4" aria-label="Brush size">
+    <button id="undo">Undo</button>
+    <button id="clear">Clear</button>
+    <button id="save">Save PNG</button>
+  </div>
+</main>
+<script>
+"use strict";
+const W = 1600, H = 1000;
+const COLORS = ["ink", "#3a5bff", "#ff5a4e", "#1fa67a", "#f2a900", "#8a5cf6"];
+const $ = (id) => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d"), stage = $("stage");
+
+const strokes = new Map(), live = new Map();
+let mine = [], tool = "pen", color = "ink", size = 4, current = null;
+let ws = null, me = null, peers = [], queued = false;
+
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const resolve = (c) => (c === "ink" ? css("--ink") : c);
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+// ---- networking: one WebSocket, reconnect with backoff -----------------------
+const roomName = new URLSearchParams(location.search).get("room") || "lobby";
+let retry = 0;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/?room=${encodeURIComponent(roomName)}`);
+  ws.onopen = () => { retry = 0; send({ type: "hello", nick: localStorage.getItem("nick") || undefined }); };
+  ws.onmessage = (e) => handle(JSON.parse(e.data));
+  ws.onclose = () => {
+    $("status").textContent = "Reconnecting…";
+    setTimeout(connect, Math.min(8000, 500 * 2 ** retry++));
+  };
+}
+const send = (m) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
+
+function handle(m) {
+  switch (m.type) {
+    case "init":
+      me = m.me; strokes.clear(); live.clear(); mine = [];
+      m.strokes.forEach((s) => strokes.set(s.id, s));
+      peers = m.peers; paintPeers(); schedule(); break;
+    case "peers": peers = m.peers; paintPeers(); break;
+    case "cursor": { const p = peers.find((x) => x.id === m.id); if (p) { p.x = m.x; p.y = m.y; paintPeers(); } break; }
+    case "live": {
+      let s = live.get(m.id);
+      if (!s || s.sid !== m.sid) { s = { sid: m.sid, pts: [], c: m.c, w: Math.min(30, +m.w || 4) }; live.set(m.id, s); }
+      s.pts.push(...m.pts); s.seen = Date.now(); schedule(); break;
+    }
+    case "stroke": strokes.set(m.stroke.id, m.stroke); live.forEach((s, k) => { if (s.sid === m.stroke.id) live.delete(k); }); schedule(); break;
+    case "remove": strokes.delete(m.id); schedule(); break;
+    case "clear": strokes.clear(); mine = []; schedule(); break;
+  }
+}
+
+// ---- rendering ---------------------------------------------------------------
+function drawStroke(s) {
+  const p = s.pts; if (!p || p.length < 2) return;
+  ctx.strokeStyle = ctx.fillStyle = resolve(s.c); ctx.lineWidth = s.w; ctx.lineCap = ctx.lineJoin = "round";
+  if (p.length === 2) { ctx.beginPath(); ctx.arc(p[0], p[1], s.w / 2, 0, 7); ctx.fill(); return; }
+  ctx.beginPath(); ctx.moveTo(p[0], p[1]);
+  for (let i = 2; i < p.length - 2; i += 2) ctx.quadraticCurveTo(p[i], p[i + 1], (p[i] + p[i + 2]) / 2, (p[i + 1] + p[i + 3]) / 2);
+  ctx.lineTo(p[p.length - 2], p[p.length - 1]); ctx.stroke();
+}
+function draw() {
+  queued = false;
+  const k = cv.width / W; ctx.setTransform(k, 0, 0, k, 0, 0); ctx.clearRect(0, 0, W, H);
+  [...strokes.values()].sort((a, b) => a.t - b.t).forEach(drawStroke);
+  live.forEach((s) => drawStroke(s));
+  if (current && !current.erasing) drawStroke(current);
+  $("undo").disabled = mine.length === 0;
+}
+function schedule() { if (!queued) { queued = true; requestAnimationFrame(draw); } }
+function fit() {
+  const r = document.querySelector("main").getBoundingClientRect();
+  const s = Math.min((r.width - 28) / W, (r.height - 14) / H);
+  const w = Math.floor(W * s), h = Math.floor(H * s), d = devicePixelRatio || 1;
+  stage.style.width = w + "px"; stage.style.height = h + "px"; cv.width = w * d; cv.height = h * d; schedule(); paintPeers();
+}
+addEventListener("resize", fit);
+
+function paintPeers() {
+  $("status").textContent = ws && ws.readyState === 1 ? `Room “${roomName}” · ${peers.length} here` : "Reconnecting…";
+  const box = $("people"); box.textContent = "";
+  peers.forEach((p) => { const d = document.createElement("div"); d.className = "person"; d.style.background = p.color; d.title = p.nick + (p.id === me ? " (you)" : ""); d.textContent = p.nick.slice(0, 1); box.appendChild(d); });
+  const layer = $("cursors"); layer.textContent = ""; const r = stage.getBoundingClientRect();
+  peers.filter((p) => p.id !== me && typeof p.x === "number").forEach((p) => {
+    const el = document.createElement("div"); el.className = "cursor"; el.style.transform = `translate(${p.x * r.width}px,${p.y * r.height}px)`;
+    el.innerHTML = `<svg width="16" height="16" viewBox="0 0 16 16"><path d="M1 1l5 13 2-5 5-2z" fill="${p.color}" stroke="#fff"/></svg><span></span>`;
+    el.lastChild.style.background = p.color; el.lastChild.textContent = p.nick; layer.appendChild(el);
+  });
+}
+
+// ---- input -------------------------------------------------------------------
+const pos = (e) => { const r = cv.getBoundingClientRect(); return [Math.round((e.clientX - r.left) / r.width * W), Math.round((e.clientY - r.top) / r.height * H)]; };
+function hit(x, y) {
+  let found = null;
+  strokes.forEach((s) => {
+    const p = s.pts, r = s.w / 2 + 10;
+    for (let i = 0; i + 1 < p.length; i += 2) {
+      const j = Math.min(i + 2, p.length - 2), dx = p[j] - p[i], dy = p[j + 1] - p[i + 1], l = dx * dx + dy * dy;
+      const t = l ? Math.max(0, Math.min(1, ((x - p[i]) * dx + (y - p[i + 1]) * dy) / l)) : 0;
+      if (Math.hypot(p[i] + t * dx - x, p[i + 1] + t * dy - y) <= r) { found = s; return; }
+    }
+  });
+  return found;
+}
+function erase(x, y) { const s = hit(x, y); if (s) { strokes.delete(s.id); mine = mine.filter((i) => i !== s.id); send({ type: "remove", id: s.id }); schedule(); } }
+
+let sentUpTo = 0, flushTimer = null, lastCursor = 0;
+function flushLive() {
+  flushTimer = null; if (!current || current.erasing) return;
+  const from = Math.max(0, sentUpTo - 2);
+  send({ type: "live", sid: current.id, c: current.c, w: current.w, pts: current.pts.slice(from) });
+  sentUpTo = current.pts.length;
+}
+cv.addEventListener("pointerdown", (e) => {
+  cv.setPointerCapture(e.pointerId); const [x, y] = pos(e);
+  if (tool === "eraser") { current = { erasing: true }; erase(x, y); return; }
+  current = { id: newId(), pts: [x, y], c: color, w: size, t: Date.now(), by: me || "" }; sentUpTo = 0; schedule();
+});
+cv.addEventListener("pointermove", (e) => {
+  const [x, y] = pos(e), now = performance.now();
+  if (now - lastCursor > 50) { lastCursor = now; send({ type: "cursor", x: x / W, y: y / H }); }
+  if (!current) return;
+  if (current.erasing) return erase(x, y);
+  const n = current.pts.length;
+  if (Math.hypot(x - current.pts[n - 2], y - current.pts[n - 1]) < 2 || n > 3000) return;
+  current.pts.push(x, y); if (!flushTimer) flushTimer = setTimeout(flushLive, 70); schedule();
+});
+function end() {
+  if (!current) return; const s = current; current = null;
+  if (s.erasing) return;
+  clearTimeout(flushTimer); flushTimer = null;
+  strokes.set(s.id, s); mine.push(s.id); send({ type: "stroke", stroke: s }); schedule();
+}
+cv.addEventListener("pointerup", end); cv.addEventListener("pointercancel", end);
+cv.addEventListener("pointerleave", () => send({ type: "cursor", x: null, y: null }));
+setInterval(() => { const n = Date.now(); live.forEach((s, k) => { if (n - s.seen > 4000) live.delete(k); }); schedule(); }, 2000);
+
+// ---- toolbar -----------------------------------------------------------------
+const setTool = (t) => { tool = t; $("pen").setAttribute("aria-pressed", t === "pen"); $("eraser").setAttribute("aria-pressed", t === "eraser"); };
+COLORS.forEach((c) => {
+  const b = document.createElement("button"); b.className = "swatch"; b.setAttribute("aria-label", c); b.setAttribute("aria-pressed", c === color);
+  b.style.background = c === "ink" ? "var(--ink)" : c;
+  b.onclick = () => { color = c; setTool("pen"); [...$("swatches").children].forEach((x) => x.setAttribute("aria-pressed", x === b)); };
+  $("swatches").appendChild(b);
+});
+$("pen").onclick = () => setTool("pen"); $("eraser").onclick = () => setTool("eraser");
+$("size").oninput = (e) => (size = +e.target.value);
+const undo = () => { const id = mine.pop(); if (id) { strokes.delete(id); send({ type: "remove", id }); schedule(); } };
+$("undo").onclick = undo;
+$("clear").onclick = () => { if (confirm("Clear the board for everyone?")) { strokes.clear(); mine = []; send({ type: "clear" }); schedule(); } };
+$("save").onclick = () => {
+  const out = document.createElement("canvas"); out.width = W; out.height = H; const c2 = out.getContext("2d");
+  c2.fillStyle = css("--board"); c2.fillRect(0, 0, W, H);
+  const exportDraw = (s) => { const p = s.pts; c2.strokeStyle = c2.fillStyle = resolve(s.c); c2.lineWidth = s.w; c2.lineCap = c2.lineJoin = "round";
+    if (p.length === 2) { c2.beginPath(); c2.arc(p[0], p[1], s.w / 2, 0, 7); c2.fill(); return; }
+    c2.beginPath(); c2.moveTo(p[0], p[1]); for (let i = 2; i < p.length - 2; i += 2) c2.quadraticCurveTo(p[i], p[i + 1], (p[i] + p[i + 2]) / 2, (p[i + 1] + p[i + 3]) / 2);
+    c2.lineTo(p[p.length - 2], p[p.length - 1]); c2.stroke(); };
+  [...strokes.values()].sort((a, b) => a.t - b.t).forEach(exportDraw);
+  const a = document.createElement("a"); a.download = "sketchroom.png"; a.href = out.toDataURL("image/png"); a.click();
+};
+addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undo(); }
+  else if (e.key === "p") setTool("pen"); else if (e.key === "e") setTool("eraser");
+});
+
+fit(); connect();
+</script>
+</body>
+</html>
